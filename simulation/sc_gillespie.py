@@ -10,6 +10,7 @@
 import numpy as np
 
 from numba import jit
+from numba import njit, prange
 
 from random import random
 
@@ -92,22 +93,20 @@ def compute_rates_ah(n, growth_rate, death_rate, N, m, p, N_taxa, N_hosts):
 
 
 # Compute the rates of the current state: single host (sh)
-@jit(nopython = True)
-def compute_rates_sh(n, growth_rate, death_rate, N, m, p, N_taxa, host):
+@jit(nopython = True,nogil=True,fastmath=True,inline="always")
+def compute_rates_sh(n_host, growth_rate, death_rate, N, m, p, N_taxa, tnRs):
     
-    death = (death_rate * (n[host] / N)).T
+    death = (death_rate * (n_host / N)).T
     
     immigration = m * p
     
-    birth = growth_rate * n[host]
+    birth = growth_rate * n_host
     
-    tnRs = np.outer(death, immigration + birth)
-        
-    return tnRs
+    np.outer(death, immigration + birth, tnRs)
 
 
 # Compute time and choice parameters
-@jit(nopython = True)
+@jit(nopython = True, nogil=True, fastmath=True, inline='always')
 def compute_time_n_choice_par(tnRs):
 
     time_par = 1. / tnRs.sum()
@@ -153,7 +152,84 @@ def sample_discrete(time_par, choice_par, N_taxa):
     return taxon_decrease, taxon_increase
 
 
+# Gillespie algorithm: one host
+@jit(nopython = True,nogil=True,fastmath=True)
+def gillespie_iteration(N_taxa, n_timepoints, time_sim, host, tnRs, time, step, n, growth_rate, death_rate, N, m, p, timeseries_time, timeseries_data):
+         hit_time = False
+
+         my_tnRs = tnRs[host]
+         time_host = time[host]
+         step_host = step[host]
+         n_host = np.copy(n[host])
+         tsdata_host = np.copy(timeseries_data[host])
+
+         while not hit_time:
+            time_par, choice_par = compute_time_n_choice_par(my_tnRs)
+            
+            taxon_decrease, taxon_increase  = sample_discrete(time_par, choice_par, N_taxa)
+            
+            time_host += time_sample(time_par)
+                                    
+            if n_timepoints != 0:
+                
+                while time_host > timeseries_time[step_host]:
+                                        
+                    tsdata_host[step_host, :] = n_host
+                    
+                    step_host += 1
+                    
+                    if time_host >= time_sim: 
+                        
+                        hit_time = True
+                        tsdata_host[step_host:, :] = n_host
+                        
+                        break
+                    
+            n_host[0, taxon_decrease] -= 1
+                
+            n_host[0, taxon_increase] += 1
+    
+            compute_rates_sh(n_host, growth_rate, death_rate, N, m, p, N_taxa, my_tnRs)
+           
+            # diag_indices is not supported in nopython
+            for i in range(N_taxa): 
+               my_tnRs[i,i] = 0
+
+         tnRs[host] = my_tnRs
+         time[host] = time_host
+         step[host] = step_host
+         n[host,:,:] = n_host
+         timeseries_data[host,:,:] = tsdata_host
+
+         return hit_time 
+
 # Gillespie algorithm: all hosts simultaneously
+
+# Parallel loop
+@njit(parallel=True,nogil=True,fastmath=True)
+def gillespie_ploop(N_taxa, n_timepoints, time_sim, sim_hosts, tnRs, time, step, n, growth_rate, death_rate, N, m, p, timeseries_time, timeseries_data):
+        time_els = [] 
+        nhosts = len(sim_hosts)
+        for i in prange(nhosts):
+            if gillespie_iteration(N_taxa, n_timepoints, time_sim,
+                                   sim_hosts[i], 
+                                   tnRs, time, step, n, growth_rate, death_rate, N, m, p,
+                                   timeseries_time, timeseries_data):
+               time_els.append(sim_hosts[i]) 
+            
+        return time_els
+
+# Helper sequential loop wrapper
+@jit(nopython = True,nogil=True,fastmath=True)
+def gillespie_loop(N_taxa, n_timepoints, time_sim, sim_hosts, tnRs, time, step, n, growth_rate, death_rate, N, m, p, timeseries_time, timeseries_data):
+    while sim_hosts.shape[0] > 0:
+        time_els = gillespie_ploop(N_taxa, n_timepoints, time_sim, 
+                          sim_hosts, tnRs, time, step, n, growth_rate, death_rate, N, m, p, 
+                          timeseries_time, timeseries_data)
+        for host in time_els:
+            sim_hosts = sim_hosts[sim_hosts != host]
+
+# Wrapper around intialization of Gillespie
 def gillespie(args):
 
     # Unpack parameters
@@ -207,39 +283,8 @@ def gillespie(args):
     tnRs[:, range(N_taxa), range(N_taxa)] = 0 # Do not modify, it causes problems !!!
     
     # While loop to compute the system dynamics until time_sim is reached
+    gillespie_loop(N_taxa, n_timepoints, time_sim, 
+                   sim_hosts, tnRs, time, step, n, growth_rate, death_rate, N, m, p, 
+                   timeseries_time, timeseries_data)
 
-    while sim_hosts.shape[0] > 0:
-        
-        for host in sim_hosts:
-        
-            time_par, choice_par = compute_time_n_choice_par(tnRs[host])
-            
-            taxon_decrease, taxon_increase  = sample_discrete(time_par, choice_par, N_taxa)
-            
-            time[host] += time_sample(time_par)
-                                    
-            if n_timepoints != 0:
-                
-                while time[host] > timeseries_time[step[host]]:
-                                        
-                    timeseries_data[host, step[host], :] = n[host]
-                    
-                    step[host] += 1
-                    
-                    if time[host] >= time_sim: 
-                        
-                        sim_hosts = sim_hosts[sim_hosts != host]
-                        
-                        timeseries_data[host, step[host]:, :] = n[host]
-                        
-                        break
-                    
-            n[host, 0, taxon_decrease] -= 1
-                
-            n[host, 0, taxon_increase] += 1
-    
-            tnRs[host] = compute_rates_sh(n, growth_rate, death_rate, N, m, p, N_taxa, host)
-            
-            tnRs[host][np.diag_indices(N_taxa)] = 0
-            
     return timeseries_time, timeseries_data
