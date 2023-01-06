@@ -208,13 +208,18 @@ def gillespie_iteration(N_taxa, n_timepoints, time_sim, host, tnRs, time, step, 
 # Parallel loop
 @njit(parallel=True,nogil=True,fastmath=True)
 def gillespie_ploop(N_taxa, n_timepoints, time_sim, sim_hosts, tnRs, time, step, n, growth_rate, death_rate, N, m, p, timeseries_time, timeseries_data):
-        time_els = [] 
         nhosts = len(sim_hosts)
+        remove_node = np.zeros(nhosts,np.int8)
         for i in prange(nhosts):
             if gillespie_iteration(N_taxa, n_timepoints, time_sim,
                                    sim_hosts[i], 
                                    tnRs, time, step, n, growth_rate, death_rate, N, m, p,
                                    timeseries_time, timeseries_data):
+               remove_node[i] = 1
+
+        time_els = [] 
+        for i in range(nhosts):
+            if remove_node[i] == 1:
                time_els.append(sim_hosts[i]) 
             
         return time_els
